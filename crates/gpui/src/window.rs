@@ -19,11 +19,11 @@ use crate::{
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
     SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
     SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 /// A gaussian is cut off after three standard deviations.
@@ -4444,11 +4444,13 @@ impl Window {
 
         let element_bounds = bounds.scale(scale_factor);
         let transform_origin = match grows_from {
-            Some(origin) => element_bounds.origin
-                + point(
-                    element_bounds.size.width * origin.x,
-                    element_bounds.size.height * origin.y,
-                ),
+            Some(origin) => {
+                element_bounds.origin
+                    + point(
+                        element_bounds.size.width * origin.x,
+                        element_bounds.size.height * origin.y,
+                    )
+            }
             None => element_bounds.center(),
         };
         let source_bounds = element_bounds.dilate(ScaledPixels(filter.blur * BLUR_REACH));
