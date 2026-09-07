@@ -67,8 +67,8 @@ image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
-num_cpus = "1.13"
-parking = "2.0.0"
+num_cpus = "1.17"
+parking = "2.2.1"
 parking_lot.workspace = true
 postage.workspace = true
 proptest = { workspace = true, optional = true }
@@ -100,8 +100,8 @@ gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
 lyon = "1.0"
-pin-project = "1.1.10"
-spin = "0.10.0"
+pin-project = "1.1.13"
+spin = "0.10.1"
 pollster.workspace = true
 url.workspace = true
 uuid.workspace = true
