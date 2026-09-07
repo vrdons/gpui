@@ -124,6 +124,7 @@ pub struct WgpuSurfaceConfig {
 struct WgpuPipelines {
     backdrops: wgpu::RenderPipeline,
     blur: wgpu::RenderPipeline,
+    kawase: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     masked: wgpu::RenderPipeline,
@@ -232,12 +233,35 @@ struct BlurParams {
     pad: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BlurAlgorithm {
+    #[default]
+    Gaussian,
+    Kawase,
+}
+
+impl BlurAlgorithm {
+    fn from_environment() -> Self {
+        match std::env::var("GPUI_BLUR_ALGORITHM").as_deref() {
+            Ok("kawase") => Self::Kawase,
+            Ok("gaussian") | Ok("") | Err(_) => Self::Gaussian,
+            Ok(value) => {
+                log::warn!("unknown GPUI_BLUR_ALGORITHM value {value:?}; using gaussian blur");
+                Self::Gaussian
+            }
+        }
+    }
+}
+
 /// The resolutions a blur can run at, as divisors of the frame. A radius picks the first step it
 /// fits within, so small blurs keep every pixel and wide ones stay cheap.
 const BLUR_STEPS: [u32; 3] = [1, 2, 4];
 
-/// A gaussian is cut off after three standard deviations.
+/// Conservative reach reserved around a blur kernel. It covers both the Gaussian tail and the
+/// larger offsets used by the bounded Kawase passes.
 const BLUR_REACH: f32 = 4.;
+const KAWASE_RADIUS_PER_PASS: f32 = 2.;
+const KAWASE_MAX_PASSES: usize = 8;
 
 /// How deeply filtered layers can nest before the innermost ones stop being filtered.
 const LAYER_DEPTH: usize = 4;
@@ -305,6 +329,7 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    blur_algorithm: BlurAlgorithm,
 }
 
 impl WgpuRenderer {
@@ -679,6 +704,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            blur_algorithm: BlurAlgorithm::from_environment(),
         })
     }
 
@@ -1010,6 +1036,19 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let kawase = create_pipeline(
+            "kawase",
+            "vs_blur",
+            "fs_kawase",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(opaque_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let blit = create_pipeline(
             "blit",
             "vs_blur",
@@ -1211,6 +1250,7 @@ impl WgpuRenderer {
         WgpuPipelines {
             backdrops,
             blur,
+            kawase,
             blit,
             composite,
             masked,
@@ -1327,41 +1367,18 @@ impl WgpuRenderer {
             .iter()
             .position(|shrink| sigma <= BLUR_REACH * *shrink as f32)
             .unwrap_or(BLUR_STEPS.len() - 1);
-        let shrink = BLUR_STEPS[step] as f32;
 
         let plain = self.write_instance_binding(
             "blur_blit_bind_group",
             instance_offset,
             &[BlurParams::default()],
         )?;
-        let across = self.write_instance_binding(
-            "blur_across_bind_group",
-            instance_offset,
-            &[BlurParams {
-                direction: [1., 0.],
-                sigma: sigma / shrink,
-                pad: 0,
-            }],
-        )?;
-        let down = self.write_instance_binding(
-            "blur_down_bind_group",
-            instance_offset,
-            &[BlurParams {
-                direction: [0., 1.],
-                sigma: sigma / shrink,
-                pad: 0,
-            }],
-        )?;
 
         let blit = self.resources().pipelines.blit.clone();
-        let blur = self.resources().pipelines.blur.clone();
 
-        // Each pass reads a kernel's width beyond what the next one needs, so the region grows
-        // from the composited clip outwards.
+        // Each pass reads beyond what the next one needs, so the region grows from the composited
+        // clip outwards.
         let reached = |clip: Bounds<ScaledPixels>, margin: f32| clip.dilate(ScaledPixels(margin));
-        let within = |clip: Option<Bounds<ScaledPixels>>, margin: f32, shrink: u32| {
-            clip.map(|clip| self.scissor(reached(clip, margin), shrink))
-        };
 
         let mut from = source;
         for shrunk in 0..step {
@@ -1373,32 +1390,105 @@ impl WgpuRenderer {
                 from,
                 &views.steps[shrunk + 1][0],
                 &plain,
-                within(clip, sigma * BLUR_REACH * 2., shrink),
+                clip.map(|clip| {
+                    let margin = match self.blur_algorithm {
+                        BlurAlgorithm::Gaussian => sigma * BLUR_REACH * 2.,
+                        BlurAlgorithm::Kawase => sigma * 2.,
+                    };
+                    self.scissor(reached(clip, margin), shrink)
+                }),
+                0,
             );
             from = &views.steps[shrunk + 1][0];
         }
 
         let shrink = BLUR_STEPS[step];
-        let [held, scratch] = &views.steps[step];
-        self.fullscreen_pass(
-            encoder,
-            "blur_across",
-            &blur,
-            from,
-            scratch,
-            &across,
-            within(clip, sigma * BLUR_REACH, shrink),
-        );
-        self.fullscreen_pass(
-            encoder,
-            "blur_down",
-            &blur,
-            scratch,
-            held,
-            &down,
-            within(clip, 0., shrink),
-        );
-        Ok(held.clone())
+        match self.blur_algorithm {
+            BlurAlgorithm::Gaussian => {
+                let shrink = shrink as f32;
+                let across = self.write_instance_binding(
+                    "blur_across_bind_group",
+                    instance_offset,
+                    &[BlurParams {
+                        direction: [1., 0.],
+                        sigma: sigma / shrink,
+                        pad: 0,
+                    }],
+                )?;
+                let down = self.write_instance_binding(
+                    "blur_down_bind_group",
+                    instance_offset,
+                    &[BlurParams {
+                        direction: [0., 1.],
+                        sigma: sigma / shrink,
+                        pad: 0,
+                    }],
+                )?;
+                let blur = self.resources().pipelines.blur.clone();
+                let [held, scratch] = &views.steps[step];
+                self.fullscreen_pass(
+                    encoder,
+                    "blur_across",
+                    &blur,
+                    from,
+                    scratch,
+                    &across,
+                    clip.map(|clip| self.scissor(reached(clip, sigma * BLUR_REACH), shrink as u32)),
+                    0,
+                );
+                self.fullscreen_pass(
+                    encoder,
+                    "blur_down",
+                    &blur,
+                    scratch,
+                    held,
+                    &down,
+                    clip.map(|clip| self.scissor(reached(clip, 0.), shrink as u32)),
+                    0,
+                );
+                Ok(held.clone())
+            }
+            BlurAlgorithm::Kawase => {
+                let blur = self.resources().pipelines.kawase.clone();
+                let radius = sigma / shrink as f32;
+                let pass_count = (radius / KAWASE_RADIUS_PER_PASS)
+                    .ceil()
+                    .clamp(1., KAWASE_MAX_PASSES as f32) as usize;
+                let mut params = [BlurParams::default(); KAWASE_MAX_PASSES];
+                for (index, param) in params.iter_mut().enumerate().take(pass_count) {
+                    *param = BlurParams {
+                        sigma: index as f32,
+                        ..Default::default()
+                    };
+                }
+                let blur_params = self.write_instance_binding(
+                    "blur_kawase_bind_group",
+                    instance_offset,
+                    &params[..pass_count],
+                )?;
+                let blur_margin = (pass_count as f32 + 0.5) * shrink as f32;
+                let [first, second] = &views.steps[step];
+                // When downsampling was used, `from` is already the first target in this pair.
+                // Start on the other half so no pass reads and writes the same texture.
+                let mut target_index = usize::from(step > 0);
+                for index in 0..pass_count {
+                    let target = if target_index == 0 { first } else { second };
+                    self.fullscreen_pass(
+                        encoder,
+                        "blur_kawase",
+                        &blur,
+                        from,
+                        target,
+                        &blur_params,
+                        clip.map(|clip| self.scissor(reached(clip, blur_margin), shrink)),
+                        index as u32,
+                    );
+                    from = target;
+                    target_index ^= 1;
+                }
+                Ok(from.clone())
+            }
+        }
     }
 
     fn fullscreen_pass(
@@ -1410,6 +1500,7 @@ impl WgpuRenderer {
         target: &wgpu::TextureView,
         instances: &InstanceBinding,
         within: Option<[u32; 4]>,
+        instance_index: u32,
     ) {
         let texture = self.create_texture_bind_group("backdrop_texture_bind_group", source);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1434,7 +1525,8 @@ impl WgpuRenderer {
         if let Some([left, top, width, height]) = within {
             pass.set_scissor_rect(left, top, width, height);
         }
-        pass.draw(0..4, instances.first_instance..instances.first_instance + 1);
+        let instance = instances.first_instance + instance_index;
+        pass.draw(0..4, instance..instance + 1);
     }
 
     fn draw_backdrops(
@@ -2206,6 +2298,7 @@ impl WgpuRenderer {
                 frame_view,
                 &plain,
                 None,
+                0,
             );
         }
 
@@ -2915,6 +3008,11 @@ impl RenderingParameters {
 mod tests {
     use super::*;
     use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+
+    #[test]
+    fn gaussian_is_the_default_blur_algorithm() {
+        assert_eq!(BlurAlgorithm::default(), BlurAlgorithm::Gaussian);
+    }
 
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {

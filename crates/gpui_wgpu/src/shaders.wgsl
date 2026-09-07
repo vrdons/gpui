@@ -1418,15 +1418,20 @@ struct Blur {
 struct BlurVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @interpolate(flat) @location(1) instance_id: u32,
 }
 
 @vertex
-fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
+fn vs_blur(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> BlurVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
 
     var out = BlurVarying();
     out.position = vec4<f32>(unit_vertex.x * 2.0 - 1.0, 1.0 - unit_vertex.y * 2.0, 0.0, 1.0);
     out.uv = unit_vertex;
+    out.instance_id = instance_id;
     return out;
 }
 
@@ -1451,6 +1456,20 @@ fn fs_blur(input: BlurVarying) -> @location(0) vec4<f32> {
     }
 
     return total / weight;
+}
+
+// A four-tap Kawase pass. The renderer repeats it with increasing offsets,
+// bounded to keep the cost independent of the requested blur radius.
+@fragment
+fn fs_kawase(input: BlurVarying) -> @location(0) vec4<f32> {
+    let blur = load_blur(input.instance_id);
+    let texel = 1.0 / vec2<f32>(textureDimensions(t_sprite));
+    let offset = texel * (max(blur.sigma, 0.0) + 0.5);
+    var total = textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(-offset.x, -offset.y));
+    total += textureSample(t_sprite, s_sprite, input.uv + vec2<f32>( offset.x, -offset.y));
+    total += textureSample(t_sprite, s_sprite, input.uv + vec2<f32>(-offset.x,  offset.y));
+    total += textureSample(t_sprite, s_sprite, input.uv + vec2<f32>( offset.x,  offset.y));
+    return total * 0.25;
 }
 
 @fragment
